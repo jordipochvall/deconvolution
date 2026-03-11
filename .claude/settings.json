@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py \"2024-12-29-2341_9-JP-RGB-Jup_lapl6_ap77.fit\" --trials 100 --top 3 --output results_2341_final)",
+      "Bash(python main.py \"2024-12-29-2150_6-JP-RGB-Jup_lapl6_ap77.fit\" --trials 100 --top 3 --output results_2150_final)",
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest tests/test_project.py -v --timeout=120)",
+      "Bash(ls /c/Users/jordi/Apps/claude-projects/deconvolution/*.fit)"
+    ]
+  }
+}

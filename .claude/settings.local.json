@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py \"2024-12-29-2150_6-JP-RGB-Jup_lapl6_ap77.fit\" --top 10 --output results_jupiter/)",
+      "Bash(python -c \"import re; data=open\\(r''C:\\\\Users\\\\jordi\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-jordi-Apps-claude-projects-deconvolution\\\\tasks\\\\bz0gc6r03.output'',''r''\\).read\\(\\); matches=re.findall\\(r''\\(\\\\d+\\)/1296'', data\\); print\\(f''Last progress: {matches[-1]}/1296''\\) if matches else print\\(''No progress found''\\)\")",
+      "Bash(python -c \"import re; data=open\\(r''C:\\\\Users\\\\jordi\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-jordi-Apps-claude-projects-deconvolution\\\\tasks\\\\bz0gc6r03.output'',''r''\\).read\\(\\); matches=re.findall\\(r''\\(\\\\d+\\)/1296'', data\\); last=matches[-1] if matches else ''?''; print\\(f''Progress: {last}/1296''\\); lines=data.strip\\(\\).split\\(''\\\\n''\\); [print\\(l\\) for l in lines[-20:] if ''Top'' in l or ''Best'' in l or ''score'' in l or ''#'' in l or ''rejected'' in l or ''Done'' in l or ''saved'' in l]\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
