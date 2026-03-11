@@ -12,10 +12,10 @@ The pipeline is designed for both large targets (for example Jupiter) and small 
 For each FITS image in an input directory:
 1. Load image data (mono, cube channel, or RGB cube).
 2. Detect the planet region with an adaptive mask.
-3. Run Bayesian optimization over PSF + deconvolution parameters.
+3. Run sequential Bayesian optimization over PSF + deconvolution parameters.
 4. Rank candidates with no-reference quality metrics.
-5. Save best result (and optional top-N), plus optional summary figures.
-6. Optionally run adaptive post-processing.
+5. Re-rank top 20 candidates after post-processing using the input planet mask.
+6. Save best result (and optional top-N), plus optional summary figures.
 
 ## Installation
 
@@ -111,8 +111,9 @@ The optimizer uses Optuna TPE with adaptive bounds:
 
 Current runtime improvements:
 - precomputed RL masks reused across trials
-- early rejection path computes only `smoothness` first
 - sequential TPE trials for maximum Bayesian learning quality
+- noise floor filter rejects candidates noisier than the input
+- sharpness floor excludes barely-sharpened candidates from ranking
 - optional parallel file processing with `--file-jobs`
 - optional parallel RGB channel processing with `--rgb-jobs`
 - reduced per-candidate memory (`float32` result storage)
@@ -144,30 +145,50 @@ Candidates are ranked by weighted normalized composite score.
 
 ```text
 deconvolution/
-  main.py
-  optimizer.py
-  deconvolve.py
-  psf.py
-  metrics.py
-  postprocess.py
-  visualize.py
+  main.py          # CLI entry point, RGB support, post-processing
+  optimizer.py     # Optuna TPE search, candidate ranking
+  deconvolve.py    # RL with TV reg + deringing, Wiener, Tikhonov
+  psf.py           # Gaussian, Moffat, Airy PSF generation
+  metrics.py       # No-reference sharpness metrics + planet mask
+  postprocess.py   # Wavelet soft-thresholding + NLM post-processing
+  visualize.py     # Summary plots (best results, metrics heatmap)
+  test_compare.py  # Compare pipeline output vs reference images
   tests/
-    test_project.py
+    test_project.py      # Unit tests
+    test_integration.py  # Full pipeline vs reference (real images)
+  test_images/           # Test data (input + reference per image)
   requirements.txt
 ```
 
 ## Tests
 
+Run unit tests:
+
+```bash
+python -m pytest tests/test_project.py -v
+```
+
+Run integration tests (requires `test_images/` with real data):
+
+```bash
+python -m pytest tests/test_integration.py -v -s
+```
+
 Run all tests:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest tests/ -v
 ```
 
-Tests cover:
+Unit tests cover:
 - PSF generation and dispatch
 - deconvolution output shape/non-negativity
 - mask-aware deconvolution parameters
 - FITS loading behavior and channel bounds
-- optimizer ranking and parallel workers
+- optimizer ranking
 - post-processing shape/no-op behavior
+
+Integration tests cover:
+- full pipeline (100 trials) on real planetary images
+- comparison against external reference deconvolutions (e.g. PixInsight)
+- pass criterion: weighted metric ratio >= 100% of reference
