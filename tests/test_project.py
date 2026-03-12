@@ -8,9 +8,11 @@ from unittest.mock import patch
 import numpy as np
 from astropy.io import fits
 
-from deconvolve import deconvolve, _wavelet_denoise
-from main import load_fits_image, _output_fits_name, parse_args, _apply_best_to_color
+from deconvolve import deconvolve, _wavelet_denoise, build_rl_masks, richardson_lucy
+from fits_io import load_fits_image, output_fits_name
+from main import parse_args
 from postprocess import postprocess, postprocess_rgb
+from rgb import apply_best_to_color
 from psf import gaussian_psf, moffat_psf, build_psf
 from metrics import composite_score
 
@@ -94,6 +96,44 @@ class TestDeconvolution(unittest.TestCase):
         )
         self.assertEqual(out.shape, self.image.shape)
 
+    def test_rl_initial_estimate_continuity(self):
+        """Two segments (20 + 5 iter) must produce the same result as one 25-iter run."""
+        params = dict(
+            iterations=25, damping=1e-3, tv_lambda=0.0,
+            deringing=0.0, contrast_boost=1.0, limb_suppression=0.0,
+        )
+        full = richardson_lucy(self.image, self.psf, **params)
+        part1 = richardson_lucy(self.image, self.psf, **{**params, "iterations": 20})
+        part2 = richardson_lucy(
+            self.image, self.psf, **{**params, "iterations": 5, "initial_estimate": part1}
+        )
+        np.testing.assert_allclose(part2, full, rtol=1e-10, atol=1e-10)
+
+    def test_rl_nesterov_shape_and_non_negative(self):
+        """Nesterov-accelerated RL must produce a valid, non-negative image."""
+        out = deconvolve(
+            "richardson_lucy", self.image, self.psf,
+            {
+                "iterations": 10, "damping": 1e-3, "tv_lambda": 0.0,
+                "deringing": 0.0, "contrast_boost": 1.0,
+                "limb_suppression": 0.0, "use_nesterov": True,
+            },
+        )
+        self.assertEqual(out.shape, self.image.shape)
+        self.assertGreaterEqual(float(out.min()), 0.0)
+
+    def test_build_rl_masks_returns_correct_types(self):
+        """build_rl_masks returns ndarrays when enabled, None when disabled."""
+        dm, lm = build_rl_masks(self.image, deringing=0.5, limb_suppression=0.85)
+        self.assertIsInstance(dm, np.ndarray)
+        self.assertIsInstance(lm, np.ndarray)
+        self.assertEqual(dm.shape, self.image.shape)
+        self.assertEqual(lm.shape, self.image.shape)
+
+        dm_none, lm_none = build_rl_masks(self.image, deringing=0.0, limb_suppression=0.0)
+        self.assertIsNone(dm_none)
+        self.assertIsNone(lm_none)
+
 
 # ---------------------------------------------------------------------------
 # Wavelet denoising
@@ -175,10 +215,40 @@ class TestRGBDeconvolution(unittest.TestCase):
         rgb = np.stack([base, base * 0.95, base * 1.05], axis=0)
         c = _Candidate()
 
-        out_serial = _apply_best_to_color(rgb, c, rgb_jobs=1)
-        out_parallel = _apply_best_to_color(rgb, c, rgb_jobs=3)
+        out_serial = apply_best_to_color(rgb, c, rgb_jobs=1)
+        out_parallel = apply_best_to_color(rgb, c, rgb_jobs=3)
         self.assertEqual(out_parallel.shape, rgb.shape)
         np.testing.assert_allclose(out_parallel, out_serial, rtol=0, atol=1e-10)
+
+    def test_apply_best_to_color_contrast_boost_preserves_ratios(self):
+        """contrast_boost must not shift colour balance: R:G:B ratios preserved."""
+        class _Candidate:
+            psf_type = "gaussian"
+            psf_params = {"fwhm": 2.0, "size": 15}
+            deconv_method = "wiener"
+            deconv_params = {"snr": 20.0, "contrast_boost": 1.3}
+
+        rng = np.random.default_rng(42)
+        # Simulate a planet: bright disk on dark sky, with distinct channel ratios
+        h, w = 64, 64
+        y, x = np.mgrid[0:h, 0:w]
+        disk = ((y - 32)**2 + (x - 32)**2) <= 20**2
+        base = np.where(disk, 200.0, 10.0).astype(np.float64)
+        base += rng.normal(0, 3, size=(h, w))
+        base = np.clip(base, 0, None)
+        rgb = np.stack([base, base * 0.80, base * 0.60], axis=0)
+        c = _Candidate()
+
+        result = apply_best_to_color(rgb, c)
+        # After global stretch, pixel-wise R/G and R/B ratios must stay constant
+        eps = 1.0  # tolerance: allow tiny numerical drift
+        ratio_rg_in  = rgb[0, disk] / np.clip(rgb[1, disk], 1e-6, None)
+        ratio_rg_out = result[0, disk] / np.clip(result[1, disk], 1e-6, None)
+        np.testing.assert_allclose(ratio_rg_out, ratio_rg_in, atol=eps)
+
+        ratio_rb_in  = rgb[0, disk] / np.clip(rgb[2, disk], 1e-6, None)
+        ratio_rb_out = result[0, disk] / np.clip(result[2, disk], 1e-6, None)
+        np.testing.assert_allclose(ratio_rb_out, ratio_rb_in, atol=eps)
 
 
 # ---------------------------------------------------------------------------
@@ -230,8 +300,8 @@ class TestLoadFits(unittest.TestCase):
 
 class TestOutputNaming(unittest.TestCase):
     def test_output_fits_name_uses_dc_suffix(self):
-        self.assertEqual(_output_fits_name("jupiter", ".fits", rank=1), "jupiter_DC.fits")
-        self.assertEqual(_output_fits_name("jupiter", ".fits", rank=2), "jupiter_DC_r2.fits")
+        self.assertEqual(output_fits_name("jupiter", ".fits", rank=1), "jupiter_DC.fits")
+        self.assertEqual(output_fits_name("jupiter", ".fits", rank=2), "jupiter_DC_r2.fits")
 
 
 class TestCLI(unittest.TestCase):

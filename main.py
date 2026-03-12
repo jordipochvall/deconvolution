@@ -1,5 +1,5 @@
-﻿"""
-Planetary deconvolution optimizer â€” CLI entry point.
+"""
+Planetary deconvolution optimizer -- CLI entry point.
 
 Usage
 -----
@@ -22,130 +22,16 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    from astropy.io import fits
-except ImportError:
-    sys.exit("astropy is required.  Install with:\n    pip install astropy\n")
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from fits_io import load_fits_image, to_luminance, save_fits
 from optimizer import run_search
-from postprocess import postprocess, postprocess_rgb
+from postprocess import PostprocessConfig, postprocess, postprocess_rgb
+from rerank import rerank_candidates
+from rgb import apply_best_to_color
 from visualize import plot_best_results, plot_metrics_heatmap
-
-
-# ---------------------------------------------------------------------------
-# FITS I/O
-# ---------------------------------------------------------------------------
-
-def load_fits_image(path: str, channel: int | None = None, verbose: bool = True) -> tuple[np.ndarray, bool]:
-    """
-    Load a FITS image and return (data, is_color).
-
-    Returns (H, W) for mono or (3, H, W) for RGB.
-    NaN/Inf pixels are replaced with the image median.
-    """
-    with fits.open(path) as hdul:
-        data = hdul[0].data
-
-    # Fallback: search other HDUs if primary has no data
-    if data is None:
-        with fits.open(path) as hdul:
-            for hdu in hdul:
-                if hdu.data is not None:
-                    data = hdu.data
-                    break
-
-    if data is None:
-        raise ValueError(f"No image data found in {path}")
-
-    data = data.astype(np.float64)
-
-    # Sanitise invalid pixels
-    bad = ~np.isfinite(data)
-    if bad.any():
-        data[bad] = np.nanmedian(data)
-
-    # (3, H, W) â†’ treat as RGB unless a specific channel was requested
-    if data.ndim == 3 and data.shape[0] == 3 and channel is None:
-        if verbose:
-            print(f"  RGB FITS detected ({data.shape}). Processing all 3 channels.")
-        return data, True
-
-    if data.ndim == 3:
-        idx = channel if channel is not None else 0
-        if idx < 0 or idx >= data.shape[0]:
-            raise ValueError(
-                f"Channel index {idx} out of range for FITS cube with shape {data.shape}."
-            )
-        if verbose:
-            print(f"  3-D FITS cube ({data.shape}). Using channel {idx}.")
-        return data[idx], False
-
-    if data.ndim == 2:
-        return data, False
-
-    raise ValueError(f"Unsupported FITS data shape: {data.shape}")
-
-
-def _to_luminance(rgb: np.ndarray) -> np.ndarray:
-    """Convert (3, H, W) RGB to luminance (H, W) using BT.601 weights."""
-    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-
-
-# ---------------------------------------------------------------------------
-# Output filename helpers
-# ---------------------------------------------------------------------------
-
-def _output_fits_name(stem: str, extension: str, rank: int) -> str:
-    """
-    Build output FITS names from the input filename.
-
-    Rank 1 uses the exact requested convention: <input>_DC<ext>
-    Additional ranks use <input>_DC_rN<ext> to avoid overwriting.
-    """
-    if rank == 1:
-        return f"{stem}_DC{extension}"
-    return f"{stem}_DC_r{rank}{extension}"
-
-
-def _save_fits(
-    data: np.ndarray,
-    candidate,
-    stem: str,
-    extension: str,
-    output_dir: Path,
-    rank: int,
-) -> Path:
-    """Save a deconvolved result (mono or RGB) as FITS with metadata headers."""
-    out_path = output_dir / _output_fits_name(stem, extension, rank)
-
-    hdr = fits.Header()
-    hdr["RANK"]     = rank
-    hdr["SCORE"]    = round(candidate.normalised_score, 6)
-    hdr["PSF_TYPE"] = candidate.psf_type
-    hdr["FWHM"]     = candidate.psf_params.get("fwhm", -1)
-    hdr["DMETHOD"]  = candidate.deconv_method
-
-    fits.writeto(str(out_path), data.astype(np.float32), header=hdr, overwrite=True)
-    return out_path
-
-
-# ---------------------------------------------------------------------------
-# Progress display
-# ---------------------------------------------------------------------------
-
-def _progress(done: int, total: int) -> None:
-    """Print an in-place progress bar."""
-    pct = done / total * 100
-    bar_len = 40
-    filled = int(bar_len * done / total)
-    bar = "#" * filled + "-" * (bar_len - filled)
-    print(f"\r  [{bar}] {pct:5.1f}%  {done}/{total}", end="", flush=True)
-    if done == total:
-        print()
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +39,7 @@ def _progress(done: int, total: int) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the deconvolution pipeline."""
     p = argparse.ArgumentParser(
         description="Find the optimal deconvolution for all planetary FITS images in a directory.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -184,62 +71,158 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Core processing
+# Progress display
 # ---------------------------------------------------------------------------
 
-def _apply_best_to_color(rgb: np.ndarray, candidate, rgb_jobs: int = 1) -> np.ndarray:
-    """Apply a candidate's PSF + deconvolution to each RGB channel independently."""
-    from psf import build_psf
-    from deconvolve import deconvolve
+def _progress(done: int, total: int) -> None:
+    """Print an in-place progress bar for Optuna trials."""
+    pct = done / total * 100
+    bar_len = 40
+    filled = int(bar_len * done / total)
+    bar = "#" * filled + "-" * (bar_len - filled)
+    print(f"\r  [{bar}] {pct:5.1f}%  {done}/{total}", end="", flush=True)
+    if done == total:
+        print()
 
-    psf = build_psf(candidate.psf_type, candidate.psf_params)
 
-    n_channels = rgb.shape[0]
-    workers = max(1, min(int(rgb_jobs), n_channels))
+# ---------------------------------------------------------------------------
+# Post-processing adaptation
+# ---------------------------------------------------------------------------
 
-    def _run_channel(ch: int) -> np.ndarray:
-        return deconvolve(candidate.deconv_method, rgb[ch], psf, candidate.deconv_params)
+def adapt_postprocessing(
+    opt_image: np.ndarray,
+    cfg: PostprocessConfig,
+    verbose: bool = False,
+) -> PostprocessConfig:
+    """Adapt post-processing strengths for small planets.
 
-    if workers == 1:
-        channels = [_run_channel(ch) for ch in range(n_channels)]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            channels = list(ex.map(_run_channel, range(n_channels)))
+    Wavelet denoising destroys fine detail on small targets (<20% of frame).
+    For those, wavelet denoising is disabled and wavelet sharpening is
+    auto-enabled instead, to enhance medium-scale features (bands, ring gaps).
 
-    return np.stack(channels, axis=0)
+    Parameters
+    ----------
+    opt_image  Luminance image for planet size detection.
+    cfg        Initial post-processing configuration.
+    verbose    Print adaptation info.
 
+    Returns
+    -------
+    A (possibly modified) PostprocessConfig.
+    """
+    from metrics import planet_mask
+
+    pmask = planet_mask(opt_image)
+    planet_frac = pmask.sum() / pmask.size
+    if planet_frac < 0.20:
+        # Per-level wavelet sharpening: boost ring/band scales, skip noise scale.
+        # Level 0 = finest (~1-2px, noise), level 1 = mid-fine (~2-4px, ring edges),
+        # level 2 = mid-coarse (~4-8px, broad structure), level 3 = coarsest (shape).
+        small_level_gains = [1.0, 1.8, 1.4, 1.0]
+        cfg = PostprocessConfig(
+            wv=0.0,                          # skip wavelet denoising
+            nlm=min(cfg.nlm, 0.003),         # very gentle NLM only
+            sharpen=1.5 if cfg.sharpen == 0.0 else cfg.sharpen,
+            dp=cfg.dp,
+            level_gains=small_level_gains,
+        )
+        if verbose:
+            print(f"  Small planet ({planet_frac*100:.1f}%): "
+                  f"auto-adapting post-processing "
+                  f"(wv=0, nlm={cfg.nlm}, sharpen={cfg.sharpen}, "
+                  f"level_gains={small_level_gains}).")
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Pipeline helpers
+# ---------------------------------------------------------------------------
 
 def _format_params(params: dict) -> str:
-    """Compact, alphabetically sorted parameter string."""
+    """Compact, alphabetically sorted parameter string for display."""
     return ", ".join(f"{k}={params[k]}" for k in sorted(params))
 
 
-def _process_one(fits_path: Path, output_dir: Path, args: argparse.Namespace) -> None:
-    """Full pipeline for a single FITS file: load â†’ optimise â†’ post-process â†’ save."""
-    verbose = not args.quiet
-    rgb_jobs = max(1, int(args.rgb_jobs))
+def _finalize_result(
+    image_data: np.ndarray,
+    candidate,
+    cached_result: np.ndarray | None,
+    is_color: bool,
+    do_post: bool,
+    cfg: PostprocessConfig,
+    rgb_jobs: int = 1,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Produce the final (optionally post-processed) image for a candidate.
 
-    # Load
+    If a cached result from re-ranking is available, it is returned
+    directly.  Otherwise the candidate is deconvolved and optionally
+    post-processed.
+    """
+    if cached_result is not None:
+        return cached_result
+
+    if is_color:
+        if verbose:
+            print("\nApplying best parameters to all 3 colour channels ...")
+        result = apply_best_to_color(image_data, candidate, rgb_jobs=rgb_jobs)
+        if do_post:
+            if verbose:
+                _print_postprocess_info(cfg)
+            result = postprocess_rgb(result, cfg, jobs=rgb_jobs)
+    else:
+        result = candidate.result
+        if do_post:
+            if verbose:
+                _print_postprocess_info(cfg)
+            result = postprocess(result, cfg)
+    return result
+
+
+def _print_postprocess_info(cfg: PostprocessConfig) -> None:
+    """Print post-processing pipeline summary to stdout."""
+    parts = [f"wavelet(wv={cfg.wv})"]
+    if cfg.sharpen > 1.0:
+        parts.append(f"sharpen(gain={cfg.sharpen})")
+    parts.append(f"NLM(h={cfg.nlm})")
+    print(f"Post-processing: {' + '.join(parts)} + disk_preservation={cfg.dp} ...")
+
+
+# ---------------------------------------------------------------------------
+# Single-file pipeline
+# ---------------------------------------------------------------------------
+
+def _load_and_prepare(
+    fits_path: Path, args: argparse.Namespace, verbose: bool,
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Load a FITS file and prepare the optimisation image.
+
+    Returns (image_data, opt_image, is_color) where opt_image is the
+    luminance channel for colour images or the raw image for mono.
+    """
     if verbose:
         print(f"\nLoading: {fits_path}")
     image_data, is_color = load_fits_image(str(fits_path), channel=args.channel, verbose=verbose)
     if verbose:
         print(f"  Shape: {image_data.shape}   min={image_data.min():.1f}  max={image_data.max():.1f}")
 
-    # Optimise on luminance (2-D)
     if is_color:
-        opt_image = _to_luminance(image_data)
+        opt_image = to_luminance(image_data)
         if verbose:
             print("  Using luminance channel for parameter optimization.")
     else:
         opt_image = image_data
+    return image_data, opt_image, is_color
 
-    # Bayesian search
+
+def _run_optimization(
+    opt_image: np.ndarray, args: argparse.Namespace, verbose: bool,
+) -> list:
+    """Run Bayesian search and return sorted candidates."""
     if verbose:
         print(f"\nBayesian optimisation: {args.trials} trials (Optuna TPE, sequential).")
-    t0 = time.time()
-    if verbose:
         print("Evaluating candidates ...")
+    t0 = time.time()
     candidates = run_search(
         opt_image,
         n_trials=args.trials,
@@ -249,252 +232,141 @@ def _process_one(fits_path: Path, output_dir: Path, args: argparse.Namespace) ->
     elapsed = time.time() - t0
     if verbose:
         print(f"Done in {elapsed:.1f} s  ({elapsed / 60:.1f} min)")
+    return candidates
 
-    # Report top results
+
+def _print_top_results(candidates: list, top_n: int) -> None:
+    """Print a summary table of the top N candidates."""
+    print(f"\nTop {top_n} results:")
+    print(f"  {'#':>3}  {'Score':>7}  {'PSF':>10}  {'PSF params':>24}  {'Method':>15}  Deconv params")
+    print("  " + "-" * 110)
+    for i, c in enumerate(candidates[:top_n]):
+        print(f"  {i+1:>3}  {c.normalised_score:>7.4f}  {c.psf_type:>10}  "
+              f"{_format_params(c.psf_params):>24}  {c.deconv_method:>15}  "
+              f"{_format_params(c.deconv_params)}")
+
+
+def _save_all_results(
+    image_data: np.ndarray,
+    candidates: list,
+    best,
+    cached_best_result: np.ndarray | None,
+    is_color: bool,
+    do_post: bool,
+    pp_cfg: PostprocessConfig,
+    fits_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+    verbose: bool,
+) -> None:
+    """Save best result, optional top-N, and optional plots."""
+    stem = fits_path.stem
+    extension = fits_path.suffix
+    rgb_jobs = max(1, int(args.rgb_jobs))
+
+    best_result = _finalize_result(
+        image_data, best, cached_best_result, is_color,
+        do_post, pp_cfg, rgb_jobs=rgb_jobs, verbose=verbose,
+    )
+    best_path = save_fits(best_result, best, stem, extension, output_dir, rank=1)
+    print(f"\n{'Best RGB' if is_color else 'Best'} result saved: {best_path}")
+
+    top_n = min(args.top, len(candidates))
+    if args.save_fits:
+        for i, c in enumerate(candidates[1:top_n]):
+            result = _finalize_result(
+                image_data, c, None, is_color,
+                do_post, pp_cfg, rgb_jobs=rgb_jobs, verbose=False,
+            )
+            out_path = save_fits(result, c, stem, extension, output_dir, rank=i + 2)
+            if verbose:
+                print(f"  Saved rank {i+2}: {out_path}")
+
+    if args.save_plots or args.show:
+        _save_plots(candidates, image_data if not is_color else to_luminance(image_data),
+                     top_n, stem, output_dir, args)
+
+
+def _save_plots(
+    candidates: list, opt_image: np.ndarray, top_n: int,
+    stem: str, output_dir: Path, args: argparse.Namespace,
+) -> None:
+    """Generate and save/show result plots."""
+    if args.show:
+        matplotlib.use("TkAgg")
+
+    plot_best_results(
+        opt_image, candidates, top_n=top_n,
+        save_path=str(output_dir / f"{stem}_best_results.png") if args.save_plots else None,
+    )
+    plot_metrics_heatmap(
+        candidates, top_n=min(20, len(candidates)),
+        save_path=str(output_dir / f"{stem}_metrics_heatmap.png") if args.save_plots else None,
+    )
+    if args.show:
+        plt.show()
+    else:
+        plt.close("all")
+
+
+def _process_one(fits_path: Path, output_dir: Path, args: argparse.Namespace) -> None:
+    """Full pipeline for a single FITS file: load, optimise, post-process, save."""
+    verbose = not args.quiet
+
+    image_data, opt_image, is_color = _load_and_prepare(fits_path, args, verbose)
+    candidates = _run_optimization(opt_image, args, verbose)
+
     top_n = min(args.top, len(candidates))
     if verbose and top_n < args.top:
         print(f"\nRequested top {args.top}, but only {top_n} candidates passed quality filters.")
-
     if verbose and top_n > 1:
-        print(f"\nTop {top_n} results:")
-        print(f"  {'#':>3}  {'Score':>7}  {'PSF':>10}  {'PSF params':>24}  {'Method':>15}  Deconv params")
-        print("  " + "-" * 110)
-        for i, c in enumerate(candidates[:top_n]):
-            print(f"  {i+1:>3}  {c.normalised_score:>7.4f}  {c.psf_type:>10}  "
-                  f"{_format_params(c.psf_params):>24}  {c.deconv_method:>15}  "
-                  f"{_format_params(c.deconv_params)}")
+        _print_top_results(candidates, top_n)
 
-    # Save results
-    stem = fits_path.stem
-    extension = fits_path.suffix
     do_post = not args.no_post
+    pp_cfg = PostprocessConfig(wv=args.wv, nlm=args.nlm,
+                               sharpen=args.sharpen, dp=args.dp)
+    if do_post:
+        pp_cfg = adapt_postprocessing(opt_image, pp_cfg, verbose=verbose)
+
     best = candidates[0]
     cached_best_result: np.ndarray | None = None
-
-    # Adapt post-processing for small planets: wavelet denoising destroys fine
-    # detail on small targets.  Instead, use wavelet sharpening (frequency-
-    # selective) to enhance medium-scale features (bands, ring gaps).
-    wv_strength = args.wv
-    nlm_strength = args.nlm
-    sharpen_gain = args.sharpen
-    if do_post:
-        from metrics import planet_mask
-        pmask = planet_mask(opt_image)
-        planet_frac = pmask.sum() / pmask.size
-        if planet_frac < 0.20:
-            wv_strength = 0.0      # skip wavelet denoising (destroys detail)
-            nlm_strength = min(nlm_strength, 0.003)  # very gentle NLM only
-            if sharpen_gain == 0.0:
-                sharpen_gain = 1.5  # auto-enable wavelet sharpening
-            if verbose:
-                print(f"  Small planet ({planet_frac*100:.1f}%): "
-                      f"auto-adapting post-processing "
-                      f"(wv=0, nlm={nlm_strength}, sharpen={sharpen_gain}).")
-
-    # Re-rank top candidates by final (post-processed) quality, not only the
-    # pre-post luminance optimisation score.
-    # Use planet mask from the INPUT image consistently (same as optimizer).
     if do_post and len(candidates) > 1:
-        from metrics import all_metrics, _WEIGHTS
-        from optimizer import _INVERTED_METRICS
-        rerank_n = min(20, len(candidates))
-        rerank_pool = list(candidates[:rerank_n])
-        seen_ids = {id(c) for c in rerank_pool}
-        for c in candidates:
-            if getattr(c, "source", "optuna") == "seed" and id(c) not in seen_ids:
-                rerank_pool.append(c)
-                seen_ids.add(id(c))
-
-        if verbose:
-            extra = len(rerank_pool) - rerank_n
-            msg = f"\nRe-ranking top {rerank_n} candidates after post-processing preview"
-            if extra > 0:
-                msg += f" + {extra} seed candidate(s)"
-            print(msg + " ...")
-
-        # Phase 1: compute post-processed metrics for each candidate
-        rerank_entries = []  # list of (candidate, trial_result, metrics)
-        for idx, c in enumerate(rerank_pool, 1):
-            if is_color:
-                trial_result = _apply_best_to_color(image_data, c, rgb_jobs=rgb_jobs)
-                trial_result = postprocess_rgb(
-                    trial_result,
-                    wavelet_threshold=wv_strength,
-                    nlm_h=nlm_strength,
-                    disk_preservation=args.dp,
-                    sharpen_gain=sharpen_gain,
-                    jobs=rgb_jobs,
-                )
-                lum = _to_luminance(trial_result)
-            else:
-                trial_result = postprocess(
-                    c.result,
-                    wavelet_threshold=wv_strength,
-                    nlm_h=nlm_strength,
-                    disk_preservation=args.dp,
-                    sharpen_gain=sharpen_gain,
-                )
-                lum = trial_result
-
-            metrics = all_metrics(lum, mask=pmask)
-            rerank_entries.append((c, trial_result, metrics))
-
-        # Phase 2: normalise metrics across the re-ranking pool (min-max),
-        # same approach the optimizer uses, so all metrics contribute equally.
-        for name in _WEIGHTS:
-            values = np.array([m[name] for _, _, m in rerank_entries])
-            lo, hi = values.min(), values.max()
-            span = hi - lo if hi > lo else 1.0
-            for _, _, m in rerank_entries:
-                m[f"{name}_norm"] = (m[name] - lo) / span
-
-        # Phase 3: pick the best using normalised weighted composite
-        best_final_score = -np.inf
-        for idx, (c, trial_result, metrics) in enumerate(rerank_entries, 1):
-            final_score = 0.0
-            for k, w in _WEIGHTS.items():
-                v = metrics.get(f"{k}_norm", 0.0)
-                if k in _INVERTED_METRICS:
-                    v = 1.0 - v
-                final_score += w * v
-
-            if verbose:
-                print(
-                    f"  [{idx}] norm_score={final_score:.4f} "
-                    f"qr={metrics['quality_ratio']:.1f} "
-                    f"lap={metrics['laplacian_variance']:.0f} "
-                    f"ten={metrics['tenengrad']:.0f}"
-                )
-            if final_score > best_final_score:
-                best_final_score = final_score
-                best = c
-                cached_best_result = trial_result.astype(np.float32, copy=False)
-
-        if verbose and best is not candidates[0]:
-            print("  Re-rank selected a different best candidate.")
+        best, cached_best_result = rerank_candidates(
+            candidates, image_data, opt_image, is_color,
+            pp_cfg, rgb_jobs=max(1, int(args.rgb_jobs)), verbose=verbose,
+        )
 
     if verbose:
         print(f"\nBest: PSF={best.psf_type} {best.psf_params}  "
               f"method={best.deconv_method} {best.deconv_params}  "
               f"score={best.normalised_score:.4f}")
 
-    if is_color:
-        if verbose:
-            print("\nApplying best parameters to all 3 colour channels ...")
-        color_result = cached_best_result
-        if color_result is None:
-            color_result = _apply_best_to_color(image_data, best, rgb_jobs=rgb_jobs)
-        if do_post and cached_best_result is None:
-            parts = [f"wavelet(wv={wv_strength})"]
-            if sharpen_gain > 1.0:
-                parts.append(f"sharpen(gain={sharpen_gain})")
-            parts.append(f"NLM(h={nlm_strength})")
-            if verbose:
-                print(f"Post-processing: {' + '.join(parts)} + disk_preservation={args.dp} ...")
-            color_result = postprocess_rgb(color_result, wavelet_threshold=wv_strength,
-                                           nlm_h=nlm_strength, disk_preservation=args.dp,
-                                           sharpen_gain=sharpen_gain, jobs=rgb_jobs)
-        best_path = _save_fits(color_result, best, stem, extension, output_dir, rank=1)
-        print(f"Best RGB result saved: {best_path}")
-    else:
-        mono_result = cached_best_result
-        if mono_result is None:
-            mono_result = best.result
-        if do_post and cached_best_result is None:
-            parts = [f"wavelet(wv={wv_strength})"]
-            if sharpen_gain > 1.0:
-                parts.append(f"sharpen(gain={sharpen_gain})")
-            parts.append(f"NLM(h={nlm_strength})")
-            if verbose:
-                print(f"\nPost-processing: {' + '.join(parts)} + disk_preservation={args.dp} ...")
-            mono_result = postprocess(
-                mono_result,
-                wavelet_threshold=wv_strength,
-                nlm_h=nlm_strength,
-                disk_preservation=args.dp,
-                sharpen_gain=sharpen_gain,
-            )
-        best_path = _save_fits(mono_result, best, stem, extension, output_dir, rank=1)
-        print(f"\nBest result saved: {best_path}")
-
-    # Save additional top-N
-    if args.save_fits:
-        for i, c in enumerate(candidates[1:top_n]):
-            if is_color:
-                result = _apply_best_to_color(image_data, c, rgb_jobs=rgb_jobs)
-                if do_post:
-                    result = postprocess_rgb(result, wavelet_threshold=wv_strength,
-                                             nlm_h=nlm_strength, disk_preservation=args.dp,
-                                             sharpen_gain=sharpen_gain, jobs=rgb_jobs)
-            else:
-                result = c.result
-                if do_post:
-                    result = postprocess(result, wavelet_threshold=wv_strength,
-                                         nlm_h=nlm_strength, disk_preservation=args.dp,
-                                         sharpen_gain=sharpen_gain)
-                    c.result = result
-            out_path = _save_fits(result, c, stem, extension, output_dir, rank=i + 2)
-            if verbose:
-                print(f"  Saved rank {i+2}: {out_path}")
-
-    # Figures are optional in default mode
-    if args.save_plots or args.show:
-        if args.show:
-            matplotlib.use("TkAgg")
-
-        plot_best_results(
-            opt_image,
-            candidates,
-            top_n=top_n,
-            save_path=str(output_dir / f"{stem}_best_results.png") if args.save_plots else None,
-        )
-        plot_metrics_heatmap(
-            candidates,
-            top_n=min(20, len(candidates)),
-            save_path=str(output_dir / f"{stem}_metrics_heatmap.png") if args.save_plots else None,
-        )
-
-        if args.show:
-            plt.show()
-        else:
-            plt.close("all")
+    _save_all_results(
+        image_data, candidates, best, cached_best_result, is_color,
+        do_post, pp_cfg, fits_path, output_dir, args, verbose,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
-    verbose = not args.quiet
-    file_jobs = max(1, int(args.file_jobs))
-
-    input_dir = Path(args.input_dir)
-    if not input_dir.is_dir():
-        sys.exit(f"Not a directory: {input_dir}")
-
-    output_dir = input_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+def _find_fits_files(input_dir: Path) -> list[Path]:
+    """Find and return sorted FITS files in a directory, or exit if none."""
     fits_files = sorted(
         f for f in input_dir.iterdir()
         if f.is_file() and f.suffix.lower() in (".fits", ".fit")
     )
-
     if not fits_files:
         sys.exit(f"No FITS files found in {input_dir}")
+    return fits_files
 
-    if verbose:
-        print(f"Found {len(fits_files)} FITS file(s) in {input_dir}")
-        for f in fits_files:
-            print(f"  {f.name}")
 
-    total_t0 = time.time()
-
-    if args.show and file_jobs > 1:
-        print("WARNING: --show is not compatible with --file-jobs > 1. Falling back to file_jobs=1.")
-        file_jobs = 1
-
+def _process_files(
+    fits_files: list[Path], output_dir: Path,
+    args: argparse.Namespace, file_jobs: int, verbose: bool,
+) -> None:
+    """Process FITS files sequentially or in parallel."""
     if file_jobs == 1:
         for idx, fits_path in enumerate(fits_files, 1):
             if verbose:
@@ -505,7 +377,6 @@ def main() -> None:
                 _process_one(fits_path, output_dir, args)
             except Exception as exc:
                 print(f"\n  ERROR processing {fits_path.name}: {exc}")
-                continue
     else:
         workers = min(file_jobs, len(fits_files))
         if verbose:
@@ -524,7 +395,34 @@ def main() -> None:
                     if verbose:
                         print(f"  [{done}/{len(fits_files)}] done: {fits_path.name}")
 
+
+def main() -> None:
+    """CLI entry point: parse args, find FITS files, run pipeline."""
+    args = parse_args()
+    verbose = not args.quiet
+    file_jobs = max(1, int(args.file_jobs))
+
+    input_dir = Path(args.input_dir)
+    if not input_dir.is_dir():
+        sys.exit(f"Not a directory: {input_dir}")
+
+    output_dir = input_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fits_files = _find_fits_files(input_dir)
+    if verbose:
+        print(f"Found {len(fits_files)} FITS file(s) in {input_dir}")
+        for f in fits_files:
+            print(f"  {f.name}")
+
+    if args.show and file_jobs > 1:
+        print("WARNING: --show is not compatible with --file-jobs > 1. Falling back to file_jobs=1.")
+        file_jobs = 1
+
+    total_t0 = time.time()
+    _process_files(fits_files, output_dir, args, file_jobs, verbose)
     total_elapsed = time.time() - total_t0
+
     if verbose:
         print(f"\n{'=' * 70}")
         print(f"All done. {len(fits_files)} images processed in "
@@ -534,4 +432,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

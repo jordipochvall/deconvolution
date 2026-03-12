@@ -9,13 +9,44 @@ Both steps are adaptive: the planet disk gets lighter denoising (preserving
 detail) while the limb and sky get stronger denoising (suppressing artifacts).
 """
 
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 import pywt
 from scipy.ndimage import gaussian_filter, sobel, binary_dilation, \
     generate_binary_structure, median_filter
 from deconvolve import _wavelet_denoise
+
+
+# ---------------------------------------------------------------------------
+# Configuration dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PostprocessConfig:
+    """Group the post-processing parameters that flow through the pipeline.
+
+    This replaces the 4 individual parameters (wv, nlm, sharpen, dp) that
+    were passed separately through adapt_postprocessing, rerank_candidates,
+    _finalize_result, postprocess, and postprocess_rgb.
+    """
+    wv: float = 25.0
+    """Wavelet soft-threshold strength (0 = disabled)."""
+
+    nlm: float = 0.008
+    """Non-Local Means filter strength (0 = disabled)."""
+
+    sharpen: float = 0.0
+    """Wavelet sharpening gain (0 = disabled, 1.5 = moderate, 2.0 = strong)."""
+
+    dp: float = 0.5
+    """Disk preservation: 0.0 = uniform, 0.5 = 50% less denoise on disk, 1.0 = skip disk."""
+
+    level_gains: list[float] | None = None
+    """Per-wavelet-level sharpening gains (finest first). None = use bell curve from ``sharpen``."""
 
 try:
     from skimage.restoration import denoise_nl_means
@@ -128,29 +159,21 @@ def _wavelet_denoise_fine(image: np.ndarray, strength: float = 3.0,
     This reduces laplacian_variance (fine-scale noise) without affecting
     tenengrad (medium-scale edge energy), improving quality_ratio.
     """
+    from wavelet_utils import swt_pad, swt_unpad
+
     min_dim = min(image.shape)
     max_levels = pywt.swt_max_level(min_dim)
     levels = min(levels, max_levels)
     if levels < 2:
         return image
 
-    # Reflect-pad
-    pad_size = max(32, 2 ** levels)
-    factor = 2 ** levels
     h, w = image.shape
-    ph = int(np.ceil((h + 2 * pad_size) / factor) * factor)
-    pw = int(np.ceil((w + 2 * pad_size) / factor) * factor)
-    pad_h = (ph - h) // 2
-    pad_w = (pw - w) // 2
-    padded = np.pad(image,
-                    ((pad_h, ph - h - pad_h), (pad_w, pw - w - pad_w)),
-                    mode="reflect")
+    padded, pad_h, pad_w = swt_pad(image, levels)
 
     coeffs = pywt.swt2(padded, wavelet, level=levels, trim_approx=True)
 
     # Noise estimate from finest level (MAD)
-    finest = coeffs[-1]
-    noise_sigma = np.median(np.abs(finest[0])) / 0.6745
+    noise_sigma = np.median(np.abs(coeffs[-1][0])) / 0.6745
 
     # Threshold ONLY the finest level (last in the list)
     thresh_val = strength * noise_sigma
@@ -160,12 +183,13 @@ def _wavelet_denoise_fine(image: np.ndarray, strength: float = 3.0,
     )
 
     result = pywt.iswt2(coeffs, wavelet)
-    return np.clip(result[pad_h:pad_h + h, pad_w:pad_w + w], 0, None)
+    return swt_unpad(result, h, w, pad_h, pad_w)
 
 
 def _wavelet_sharpen(image: np.ndarray, gain: float = 1.5,
                      levels: int = 4, wavelet: str = "bior1.5",
-                     protect_fine: bool = True) -> np.ndarray:
+                     protect_fine: bool = True,
+                     level_gains: list[float] | None = None) -> np.ndarray:
     """
     Enhance planetary detail by amplifying wavelet detail coefficients.
 
@@ -179,12 +203,21 @@ def _wavelet_sharpen(image: np.ndarray, gain: float = 1.5,
     ----------
     image          Input image (H, W), float.
     gain           Enhancement factor for the peak detail scale (>1 = sharpen).
+                   Ignored when *level_gains* is provided.
     levels         SWT decomposition depth (3–5).
     wavelet        Wavelet family (default bior1.5, good edge preservation).
     protect_fine   If True, leave the finest scale untouched (noise protection).
+                   Ignored when *level_gains* is provided.
+    level_gains    Per-level gains (finest scale first, coarsest last).
+                   When provided, overrides the bell-curve logic entirely.
+                   1.0 = unchanged, >1.0 = amplify, <1.0 = attenuate.
     """
-    if gain <= 1.0:
+    if level_gains is None and gain <= 1.0:
         return image
+    if level_gains is not None and all(g <= 1.0 for g in level_gains):
+        return image
+
+    from wavelet_utils import swt_pad, swt_unpad
 
     min_dim = min(image.shape)
     max_levels = pywt.swt_max_level(min_dim)
@@ -192,160 +225,162 @@ def _wavelet_sharpen(image: np.ndarray, gain: float = 1.5,
     if levels < 2:
         return image
 
-    # Reflect-pad for SWT (same strategy as _wavelet_denoise)
-    pad_size = max(32, 2 ** levels)
-    factor = 2 ** levels
     h, w = image.shape
-    ph = int(np.ceil((h + 2 * pad_size) / factor) * factor)
-    pw = int(np.ceil((w + 2 * pad_size) / factor) * factor)
-    pad_h = (ph - h) // 2
-    pad_w = (pw - w) // 2
-    padded = np.pad(image,
-                    ((pad_h, ph - h - pad_h), (pad_w, pw - w - pad_w)),
-                    mode="reflect")
+    padded, pad_h, pad_w = swt_pad(image, levels)
 
     coeffs = pywt.swt2(padded, wavelet, level=levels, trim_approx=True)
 
-    # Scale-dependent gain: bell curve peaking at medium scales.
-    # Level 1 (finest) = noise → gain 1.0 if protect_fine else full gain.
-    # Levels 2–3 = planetary detail → peak gain.
-    # Level N (coarsest) = planet shape → gain 1.0.
-    n_detail = len(coeffs) - 1  # number of detail levels
+    n_detail = len(coeffs) - 1
     for level_idx in range(1, len(coeffs)):
         depth = len(coeffs) - level_idx  # 1 = finest, n_detail = coarsest
 
-        if protect_fine and depth == 1:
-            scale_gain = 1.0  # don't amplify noise
-        elif depth == n_detail:
-            scale_gain = 1.0  # don't distort overall shape
+        if level_gains is not None:
+            # Per-level mode: depth 1 → index 0 (finest first)
+            gi = depth - 1
+            scale_gain = level_gains[gi] if gi < len(level_gains) else 1.0
         else:
-            # Bell-shaped: peak at intermediate scales
-            centre = n_detail / 2.0
-            dist = abs(depth - centre) / max(centre, 1.0)
-            scale_gain = 1.0 + (gain - 1.0) * (1.0 - dist ** 2)
+            # Bell-curve mode (original behaviour)
+            if protect_fine and depth == 1:
+                scale_gain = 1.0
+            elif depth == n_detail:
+                scale_gain = 1.0
+            else:
+                centre = n_detail / 2.0
+                dist = abs(depth - centre) / max(centre, 1.0)
+                scale_gain = 1.0 + (gain - 1.0) * (1.0 - dist ** 2)
 
         if scale_gain != 1.0:
             coeffs[level_idx] = tuple(c * scale_gain for c in coeffs[level_idx])
 
     result = pywt.iswt2(coeffs, wavelet)
-    return np.clip(result[pad_h:pad_h + h, pad_w:pad_w + w], 0, None)
+    return swt_unpad(result, h, w, pad_h, pad_w)
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _blend_with_disk_mask(
+    original: np.ndarray,
+    processed: np.ndarray,
+    disk_mask: np.ndarray | None,
+    preservation: float,
+) -> np.ndarray:
+    """Blend processed result with original using disk preservation mask.
+
+    On the planet disk, more of the original is preserved (less denoising).
+    On sky/limb, the processed result is used fully.
+    """
+    if disk_mask is not None and preservation > 0:
+        blend = disk_mask * preservation
+        return blend * original + (1.0 - blend) * processed
+    return processed
+
+
+def _apply_nlm(
+    result: np.ndarray,
+    nlm_h: float,
+    disk_mask: np.ndarray | None,
+    dp: float,
+) -> np.ndarray:
+    """Apply Non-Local Means denoising with adaptive disk preservation."""
+    if nlm_h <= 0:
+        return result
+    if not _HAS_SKIMAGE:
+        print("  WARNING: scikit-image not installed, skipping NLM. "
+              "Install with: pip install scikit-image")
+        return result
+
+    vmin, vmax = result.min(), result.max()
+    span = vmax - vmin
+    if span <= 1e-30:
+        return result
+
+    norm = (result - vmin) / span
+    denoised = denoise_nl_means(
+        norm, h=nlm_h, patch_size=5, patch_distance=7, fast_mode=True,
+    )
+    denoised = denoised * span + vmin
+    return _blend_with_disk_mask(result, denoised, disk_mask, dp)
+
+
 def postprocess(
     image: np.ndarray,
-    wavelet_threshold: float = 10.0,
+    cfg: PostprocessConfig | None = None,
+    *,
     wavelet_levels: int = 4,
-    nlm_h: float = 0.003,
-    disk_preservation: float = 0.5,
     limb_deringing: float = 0.0,
     limb_width: int = 8,
     median_size: int = 5,
+    # Legacy keyword-only args (used when cfg is None)
+    wavelet_threshold: float = 10.0,
+    nlm_h: float = 0.003,
+    disk_preservation: float = 0.5,
     sharpen_gain: float = 0.0,
 ) -> np.ndarray:
-    """
-    Adaptive wavelet + NLM post-processing for deconvolved images.
+    """Adaptive wavelet + NLM post-processing for deconvolved images."""
+    if cfg is None:
+        cfg = PostprocessConfig(wv=wavelet_threshold, nlm=nlm_h,
+                                sharpen=sharpen_gain, dp=disk_preservation)
 
-    Parameters
-    ----------
-    image              Deconvolved image (H, W), float.
-    wavelet_threshold  Wavelet soft-threshold strength (0 = disabled).
-    wavelet_levels     Wavelet decomposition levels (3–5).
-    nlm_h              NLM filter strength (0 = disabled).
-    disk_preservation  Reduce denoising on planet disk: 0.0 = uniform,
-                       0.5 = disk gets 50% less, 1.0 = disk untouched.
-    limb_deringing     Limb median filter strength 0..1 (0 = disabled).
-    limb_width         Half-width of the limb zone (pixels).
-    median_size        Median filter kernel size (must be odd).
-    sharpen_gain       Wavelet sharpening gain (0 = disabled, 1.5 = moderate,
-                       2.0 = strong).  Enhances medium-scale detail (bands,
-                       ring gaps) without amplifying fine-scale noise.
-    """
-    result = image.copy()
-
-    # Step 1: Optional limb deringing (before denoising)
-    result = _deringing_limb(result, strength=limb_deringing,
+    result = _deringing_limb(image.copy(), strength=limb_deringing,
                              width=limb_width, median_size=median_size)
 
-    # Build adaptive mask once (reused for wavelet and NLM)
-    disk_mask = _adaptive_blend_mask(image) if disk_preservation > 0 else None
+    disk_mask = _adaptive_blend_mask(image) if cfg.dp > 0 else None
 
-    # Step 2: Wavelet denoising (adaptive)
-    if wavelet_threshold > 0:
+    # Wavelet denoising
+    if cfg.wv > 0:
         denoised = np.clip(
-            _wavelet_denoise(result, threshold=wavelet_threshold, levels=wavelet_levels),
+            _wavelet_denoise(result, threshold=cfg.wv, levels=wavelet_levels),
             0, None,
         )
-        if disk_mask is not None:
-            blend = disk_mask * disk_preservation
-            result = blend * result + (1.0 - blend) * denoised
-        else:
-            result = denoised
+        result = _blend_with_disk_mask(result, denoised, disk_mask, cfg.dp)
 
-    # Step 3: Wavelet sharpening (frequency-selective detail enhancement)
-    if sharpen_gain > 1.0:
-        sharpened = _wavelet_sharpen(result, gain=sharpen_gain,
-                                     levels=wavelet_levels)
+    # Wavelet sharpening (opposite blend: apply sharpening ON disk, not sky)
+    if cfg.sharpen > 1.0 or cfg.level_gains is not None:
+        sharpened = _wavelet_sharpen(result, gain=cfg.sharpen, levels=wavelet_levels,
+                                     level_gains=cfg.level_gains)
         if disk_mask is not None:
-            # Apply sharpening only on the planet disk (not on sky)
-            blend = disk_mask
-            result = blend * sharpened + (1.0 - blend) * result
+            result = _blend_with_disk_mask(sharpened, result, disk_mask, 1.0)
         else:
             result = sharpened
 
-    # Step 4: Non-Local Means denoising (adaptive)
-    if nlm_h > 0:
-        if not _HAS_SKIMAGE:
-            print("  WARNING: scikit-image not installed, skipping NLM. "
-                  "Install with: pip install scikit-image")
-        else:
-            vmin, vmax = result.min(), result.max()
-            span = vmax - vmin
-            if span > 1e-30:
-                norm = (result - vmin) / span
-                denoised_nlm = denoise_nl_means(
-                    norm, h=nlm_h, patch_size=5, patch_distance=7, fast_mode=True,
-                )
-                denoised_nlm = denoised_nlm * span + vmin
-                if disk_mask is not None:
-                    blend = disk_mask * disk_preservation
-                    result = blend * result + (1.0 - blend) * denoised_nlm
-                else:
-                    result = denoised_nlm
+    # NLM denoising
+    result = _apply_nlm(result, cfg.nlm, disk_mask, cfg.dp)
 
     return result
 
 
 def postprocess_rgb(
     rgb: np.ndarray,
-    wavelet_threshold: float = 10.0,
+    cfg: PostprocessConfig | None = None,
+    *,
     wavelet_levels: int = 4,
-    nlm_h: float = 0.003,
-    disk_preservation: float = 0.5,
     limb_deringing: float = 0.0,
     limb_width: int = 8,
     median_size: int = 5,
-    sharpen_gain: float = 0.0,
     jobs: int = 1,
+    # Legacy keyword-only args (used when cfg is None)
+    wavelet_threshold: float = 10.0,
+    nlm_h: float = 0.003,
+    disk_preservation: float = 0.5,
+    sharpen_gain: float = 0.0,
 ) -> np.ndarray:
     """Apply post-processing to each channel of an (3, H, W) image."""
+    if cfg is None:
+        cfg = PostprocessConfig(wv=wavelet_threshold, nlm=nlm_h,
+                                sharpen=sharpen_gain, dp=disk_preservation)
+
     n_channels = rgb.shape[0]
     workers = max(1, min(int(jobs), n_channels))
 
     def _run_channel(ch: int) -> np.ndarray:
         return postprocess(
-            rgb[ch],
-            wavelet_threshold=wavelet_threshold,
+            rgb[ch], cfg,
             wavelet_levels=wavelet_levels,
-            nlm_h=nlm_h,
-            disk_preservation=disk_preservation,
             limb_deringing=limb_deringing,
             limb_width=limb_width,
             median_size=median_size,
-            sharpen_gain=sharpen_gain,
         )
 
     if workers == 1:

@@ -25,9 +25,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from metrics import all_metrics, planet_mask, _WEIGHTS
-from optimizer import run_search, _INVERTED_METRICS
-from postprocess import postprocess, postprocess_rgb
+from main import adapt_postprocessing
+from rerank import rerank_candidates
+from rgb import apply_best_to_color
+from metrics import all_metrics, planet_mask, _WEIGHTS, _INVERTED_METRICS
+from optimizer import run_search
+from postprocess import PostprocessConfig, postprocess, postprocess_rgb
 
 TEST_DIR = PROJECT_ROOT / "test_images"
 
@@ -99,102 +102,25 @@ def _run_pipeline(input_image: np.ndarray) -> np.ndarray:
     candidates = run_search(opt_image, n_trials=N_TRIALS, verbose=False)
     best = candidates[0]
 
-    # Determine post-processing strength
-    pmask = planet_mask(opt_image)
-    planet_frac = pmask.sum() / pmask.size
-    small_planet = planet_frac < 0.20
+    # Determine post-processing strength (same defaults as CLI)
+    pp_cfg = adapt_postprocessing(
+        opt_image, PostprocessConfig(wv=25.0, nlm=0.008, sharpen=0.0),
+    )
 
-    if small_planet:
-        wv_strength = 0.0
-        nlm_strength = 0.003
-        sharpen_gain = 1.5
-    else:
-        wv_strength = 25.0
-        nlm_strength = 0.008
-        sharpen_gain = 0.0
+    # Re-rank top candidates after post-processing
+    best, cached_best_result = rerank_candidates(
+        candidates, input_image, opt_image, is_color, pp_cfg,
+    )
 
-    # Re-rank top candidates after post-processing (mirrors main.py logic)
-    if len(candidates) > 1:
-        rerank_n = min(20, len(candidates))
-        rerank_pool = list(candidates[:rerank_n])
-        seen_ids = {id(c) for c in rerank_pool}
-        for c in candidates:
-            if getattr(c, "source", "optuna") == "seed" and id(c) not in seen_ids:
-                rerank_pool.append(c)
-                seen_ids.add(id(c))
-
-        best_final_score = -np.inf
-        cached_best_result = None
-
-        for c in rerank_pool:
-            if is_color:
-                from deconvolve import deconvolve
-                from psf import build_psf
-                psf = build_psf(c.psf_type, c.psf_params)
-                channels = [deconvolve(c.deconv_method, input_image[ch], psf, c.deconv_params)
-                            for ch in range(3)]
-                trial_result = np.stack(channels, axis=0)
-                trial_result = postprocess_rgb(
-                    trial_result,
-                    wavelet_threshold=wv_strength,
-                    nlm_h=nlm_strength,
-                    sharpen_gain=sharpen_gain,
-                )
-                lum = _to_luminance(trial_result)
-            else:
-                trial_result = postprocess(
-                    c.result,
-                    wavelet_threshold=wv_strength,
-                    nlm_h=nlm_strength,
-                    sharpen_gain=sharpen_gain,
-                )
-                lum = trial_result
-
-            metrics = all_metrics(lum, mask=pmask)
-
-            # Normalise and score (simplified inline version)
-            # We collect all metrics first, then normalise
-            from optimizer import _composite_normalised, _normalise_metrics
-            # Store for later normalisation
-            c._rerank_result = trial_result
-            c._rerank_metrics = metrics
-
-        # Normalise across pool
-        for name in _WEIGHTS:
-            values = np.array([c._rerank_metrics[name] for c in rerank_pool])
-            lo, hi = values.min(), values.max()
-            span = hi - lo if hi > lo else 1.0
-            for c in rerank_pool:
-                c._rerank_metrics[f"{name}_norm"] = (c._rerank_metrics[name] - lo) / span
-
-        for c in rerank_pool:
-            final_score = 0.0
-            for k, w in _WEIGHTS.items():
-                v = c._rerank_metrics.get(f"{k}_norm", 0.0)
-                if k in _INVERTED_METRICS:
-                    v = 1.0 - v
-                final_score += w * v
-            if final_score > best_final_score:
-                best_final_score = final_score
-                best = c
-                cached_best_result = c._rerank_result
-
-        if cached_best_result is not None:
-            return cached_best_result
+    if cached_best_result is not None:
+        return cached_best_result
 
     # Fallback: apply best without re-ranking
     if is_color:
-        from deconvolve import deconvolve
-        from psf import build_psf
-        psf = build_psf(best.psf_type, best.psf_params)
-        channels = [deconvolve(best.deconv_method, input_image[ch], psf, best.deconv_params)
-                    for ch in range(3)]
-        result = np.stack(channels, axis=0)
-        result = postprocess_rgb(result, wavelet_threshold=wv_strength,
-                                 nlm_h=nlm_strength, sharpen_gain=sharpen_gain)
+        result = apply_best_to_color(input_image, best)
+        result = postprocess_rgb(result, pp_cfg)
     else:
-        result = postprocess(best.result, wavelet_threshold=wv_strength,
-                             nlm_h=nlm_strength, sharpen_gain=sharpen_gain)
+        result = postprocess(best.result, pp_cfg)
 
     return result
 

@@ -52,8 +52,8 @@ def _preserve_brightness(
     return result * ratio
 
 
-def _contrast_stretch(result: np.ndarray, original: np.ndarray,
-                      boost: float = 1.3) -> np.ndarray:
+def contrast_stretch(result: np.ndarray, original: np.ndarray,
+                     boost: float = 1.3) -> np.ndarray:
     """
     Stretch result's dynamic range relative to the original.
 
@@ -131,35 +131,25 @@ def _wavelet_denoise(image: np.ndarray, threshold: float = 0.1,
     Uses reflect-padding before SWT to prevent periodic boundary artifacts
     at the planet limb.
     """
+    from wavelet_utils import swt_pad, swt_unpad
+
     min_dim = min(image.shape)
     max_levels = pywt.swt_max_level(min_dim)
     levels = min(levels, max_levels)
     if levels < 1:
         return image
 
-    # Reflect-pad to avoid periodic boundary artifacts.
-    # Padded dimensions must be multiples of 2^levels for SWT.
-    pad_size = max(32, 2 ** levels)
-    factor = 2 ** levels
     h, w = image.shape
-    ph = int(np.ceil((h + 2 * pad_size) / factor) * factor)
-    pw = int(np.ceil((w + 2 * pad_size) / factor) * factor)
-    pad_h = (ph - h) // 2
-    pad_w = (pw - w) // 2
-    padded = np.pad(image,
-                    ((pad_h, ph - h - pad_h), (pad_w, pw - w - pad_w)),
-                    mode="reflect")
+    padded, pad_h, pad_w = swt_pad(image, levels)
 
-    # Stationary wavelet transform (shift-invariant, no decimation)
     coeffs = pywt.swt2(padded, wavelet, level=levels, trim_approx=True)
 
     # Noise estimate from finest detail level (MAD estimator)
-    finest_detail = coeffs[-1]
-    noise_sigma = np.median(np.abs(finest_detail[0])) / 0.6745
+    noise_sigma = np.median(np.abs(coeffs[-1][0])) / 0.6745
 
     # Soft-threshold each detail level with geometrically decreasing strength
-    for level_idx in range(1, len(coeffs)):  # skip coeffs[0] (approximation)
-        depth = len(coeffs) - level_idx       # 1 = finest, levels = coarsest
+    for level_idx in range(1, len(coeffs)):
+        depth = len(coeffs) - level_idx
         scale_factor = 1.0 / (2 ** (depth - 1))
         thresh_val = threshold * noise_sigma * scale_factor
 
@@ -168,9 +158,8 @@ def _wavelet_denoise(image: np.ndarray, threshold: float = 0.1,
             for c in coeffs[level_idx]
         )
 
-    # Inverse SWT and crop back to original size
     result = pywt.iswt2(coeffs, wavelet)
-    return result[pad_h:pad_h + h, pad_w:pad_w + w]
+    return swt_unpad(result, h, w, pad_h, pad_w)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +218,88 @@ def _build_limb_mask(image: np.ndarray, width: int = 15) -> np.ndarray:
 # Richardson-Lucy with TV regularisation + limb protection
 # ---------------------------------------------------------------------------
 
+def build_rl_masks(
+    image: np.ndarray,
+    deringing: float,
+    limb_suppression: float,
+    limb_width: int = 15,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Pre-compute RL regularisation masks from the input image.
+
+    Useful when running RL in segments (checkpointing for trial pruning):
+    compute the masks once from the original image, then pass them to each
+    segment to guarantee identical results to a single continuous run.
+
+    Returns (dering_mask, limb_mask) — either may be None if disabled.
+    """
+    dm = _build_deringing_mask(image) if deringing > 0 else None
+    lm = _build_limb_mask(image, width=limb_width) if limb_suppression > 0 else None
+    return dm, lm
+
+
+def _rl_setup_masks(
+    img: np.ndarray,
+    deringing: float,
+    limb_suppression: float,
+    dering_mask: np.ndarray | None,
+    limb_mask: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Prepare deringing and limb masks for the RL iteration loop."""
+    if deringing > 0:
+        dm = dering_mask if dering_mask is not None else _build_deringing_mask(img)
+    else:
+        dm = None
+
+    if limb_suppression > 0:
+        base = limb_mask if limb_mask is not None else _build_limb_mask(img)
+        lm = base * limb_suppression
+    else:
+        lm = None
+    return dm, lm
+
+
+def _rl_compute_correction(
+    img: np.ndarray,
+    y: np.ndarray,
+    H: np.ndarray,
+    H_conj: np.ndarray,
+    eps: float,
+    deringing: float,
+    dering_mask: np.ndarray | None,
+    limb_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Compute one RL correction step: forward model, ratio, back-projection, masking."""
+    blurred = np.real(ifft2(H * fft2(y)))
+    ratio = img / (blurred + eps)
+    correction = np.real(ifft2(H_conj * fft2(ratio)))
+
+    if dering_mask is not None:
+        correction = 1.0 + (correction - 1.0) * (
+            dering_mask + (1.0 - deringing) * (1.0 - dering_mask)
+        )
+    if limb_mask is not None:
+        correction = 1.0 + (correction - 1.0) * (1.0 - limb_mask)
+    return correction
+
+
+def _rl_finalize(
+    estimate: np.ndarray,
+    img: np.ndarray,
+    wavelet_reg: float,
+    wavelet_levels: int,
+    contrast_boost: float,
+) -> np.ndarray:
+    """Apply optional post-RL wavelet denoising and contrast boost."""
+    if wavelet_reg > 0:
+        estimate = np.clip(
+            _wavelet_denoise(estimate, threshold=wavelet_reg, levels=wavelet_levels),
+            0, None,
+        )
+    if contrast_boost != 1.0:
+        estimate = contrast_stretch(estimate, img, boost=contrast_boost)
+    return estimate
+
+
 def richardson_lucy(
     image: np.ndarray,
     psf: np.ndarray,
@@ -242,91 +313,46 @@ def richardson_lucy(
     limb_suppression: float = 0.85,
     dering_mask: np.ndarray | None = None,
     limb_mask: np.ndarray | None = None,
+    initial_estimate: np.ndarray | None = None,
+    use_nesterov: bool = False,
 ) -> np.ndarray:
-    """
-    FFT-based Richardson-Lucy with TV regularisation and limb protection.
+    """FFT-based Richardson-Lucy with TV regularisation and limb protection.
 
-    Key features:
-    - Frequency-domain convolution (exact, no boundary accumulation).
-    - Per-iteration TV diffusion to suppress noise without killing detail.
-    - Deringing mask to dampen corrections in dark sky regions.
-    - Limb correction clamping: the multiplicative RL update is dampened
-      toward 1.0 in the planet limb zone, preventing Gibbs overshoot from
-      accumulating over iterations.  The disk interior is unaffected.
-
-    Parameters
-    ----------
-    image          Observed (blurred, noisy) image.
-    psf            Point spread function (must sum to 1).
-    iterations     Number of RL iterations.
-    damping        Added to denominators to suppress noise amplification.
-    tv_lambda      TV diffusion step size per iteration (0 = disabled).
-    deringing      Sky deringing strength 0..1 (0 = disabled).
-    contrast_boost Dynamic range multiplier vs original (1.0 = no change).
-    wavelet_reg    Post-RL wavelet threshold (0 = disabled).
-    wavelet_levels Wavelet decomposition depth (3–5).
-    limb_suppression  Correction clamping at limb (0 = off, 0.85 = default,
-                      1.0 = limb frozen at initial estimate).
+    Features: frequency-domain convolution, per-iteration TV diffusion,
+    deringing mask, limb correction clamping, optional Nesterov momentum,
+    and warm-start from a previous segment.
     """
     img = _to_float(image)
     psf = psf.astype(np.float64)
 
-    # Pre-compute PSF transfer function and its conjugate
     H = fft2(_pad_psf_to_image(psf, img.shape))
     H_conj = np.conj(H)
 
-    estimate = img.copy()
+    estimate = _to_float(initial_estimate) if initial_estimate is not None else img.copy()
     eps = damping if damping > 0 else 1e-12
 
-    # Build masks once before the loop
-    if deringing > 0:
-        dering_mask = dering_mask if dering_mask is not None else _build_deringing_mask(img)
-    else:
-        dering_mask = None
+    dm, lm = _rl_setup_masks(img, deringing, limb_suppression, dering_mask, limb_mask)
 
-    if limb_suppression > 0:
-        base_limb_mask = limb_mask if limb_mask is not None else _build_limb_mask(img)
-        limb_mask = base_limb_mask * limb_suppression
-    else:
-        limb_mask = None
+    prev_estimate = estimate.copy() if use_nesterov else None
 
-    for _ in range(iterations):
-        # Forward model: H * estimate
-        blurred = np.real(ifft2(H * fft2(estimate)))
-        ratio = img / (blurred + eps)
+    for k in range(iterations):
+        # Nesterov momentum: extrapolate with k/(k+3) annealing schedule
+        if use_nesterov and k > 0:
+            beta = k / (k + 3.0)
+            y = np.clip(estimate + beta * (estimate - prev_estimate), 1e-10, None)
+        else:
+            y = estimate
 
-        # Back-projection: H^T * ratio
-        correction = np.real(ifft2(H_conj * fft2(ratio)))
+        if use_nesterov:
+            prev_estimate = estimate.copy()
 
-        # Deringing: dampen corrections in dark (sky) regions
-        if dering_mask is not None:
-            correction = 1.0 + (correction - 1.0) * (
-                dering_mask + (1.0 - deringing) * (1.0 - dering_mask)
-            )
+        correction = _rl_compute_correction(img, y, H, H_conj, eps, deringing, dm, lm)
+        estimate = np.clip(y * correction, 0, None)
 
-        # Limb clamping: dampen corrections toward 1.0 at the planet limb
-        # to prevent Gibbs overshoot from accumulating across iterations
-        if limb_mask is not None:
-            correction = 1.0 + (correction - 1.0) * (1.0 - limb_mask)
-
-        # Multiplicative RL update
-        estimate = np.clip(estimate * correction, 0, None)
-
-        # TV diffusion step (edge-preserving noise suppression)
         if tv_lambda > 0:
             estimate = np.clip(_tv_denoise_step(estimate, dt=tv_lambda), 0, None)
 
-    # Optional post-RL wavelet denoising
-    if wavelet_reg > 0:
-        estimate = np.clip(
-            _wavelet_denoise(estimate, threshold=wavelet_reg, levels=wavelet_levels), 0, None
-        )
-
-    # Optional contrast boost
-    if contrast_boost != 1.0:
-        estimate = _contrast_stretch(estimate, img, boost=contrast_boost)
-
-    return estimate
+    return _rl_finalize(estimate, img, wavelet_reg, wavelet_levels, contrast_boost)
 
 
 # ---------------------------------------------------------------------------
