@@ -2,8 +2,7 @@
 
 Automated deconvolution of planetary FITS images using Bayesian optimisation
 (Optuna TPE) to find optimal PSF + algorithm parameters, ranked by
-no-reference sharpness metrics. Achieves results comparable to or better than
-PixInsight on Jupiter and Saturn images.
+no-reference sharpness metrics. 
 
 ## Quick start
 
