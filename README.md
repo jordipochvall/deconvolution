@@ -56,10 +56,10 @@ focuses exploration there.
 
 | Parameter         | Large planet (>20%)    | Small planet (<20%)    |
 |-------------------|------------------------|------------------------|
-| PSF FWHM          | 1.0–5.0 px             | 1.0–1.5 px             |
-| RL iterations     | 15–300                 | 2–5                    |
+| PSF FWHM          | 1.0–5.0 px             | 1.0–2.5 px             |
+| RL iterations     | 15–300                 | 2–20                   |
 | RL damping        | 1e-4–1e-2 (log)        | 1e-4–1e-2 (log)        |
-| TV lambda         | 0.0–0.3                | 0.25–0.3               |
+| TV lambda         | 0.0–0.3                | 0.30–0.80              |
 | Contrast boost    | 1.0–1.5                | 1.0                    |
 | Limb suppression  | 0.85                   | 0.3                    |
 
@@ -140,7 +140,7 @@ This normalisation ensures that no single metric dominates.
 percentile). Critical for small planets like Saturn (~6% of frame) where a
 fixed percentile would include sky pixels.
 
-### Stage 3: Re-ranking (`main.py: rerank_candidates`)
+### Stage 3: Re-ranking (`rerank.py`)
 
 The top 20 Optuna candidates (plus seed candidates) are re-evaluated **after
 full post-processing**. This is important because Optuna scores are computed
@@ -185,14 +185,20 @@ to 61% of PI. Auto-disabled for small planets (<20% of frame).
 
 #### 4.3 Wavelet sharpening
 
-Amplifies **medium-scale** SWT detail coefficients (planetary bands, ring
-gaps, cloud features) with a bell-curve gain profile:
+Amplifies SWT detail coefficients to enhance planetary features. Two modes:
+
+**Bell-curve mode** (default): automatic gain profile based on a single `gain`
+parameter:
 - Finest scale (noise) → gain = 1.0 (untouched).
 - Medium scales (detail) → gain = user-specified (1.5–2.0).
 - Coarsest scale (shape) → gain = 1.0 (untouched).
 
-Auto-enabled for small planets at `gain=1.5` when wavelet denoising is
-disabled.
+**Per-level mode** (`level_gains`): explicit control over each wavelet level
+(finest first). Example: `[1.0, 1.8, 1.4, 1.0]` — skip noise scale, boost
+ring edges (1.8×), moderate broad structure (1.4×), preserve shape.
+
+Auto-enabled for small planets with per-level gains targeting ring/band
+scales.
 
 #### 4.4 Non-Local Means denoising (NLM)
 
@@ -213,9 +219,10 @@ Controlled by `dp` (disk preservation): 0.0 = uniform everywhere,
 For planets covering <20% of the frame (e.g. Saturn):
 - Wavelet denoising disabled (`wv=0`).
 - NLM limited to `h=0.003` (very gentle).
-- Wavelet sharpening auto-enabled (`gain=1.5`).
+- Wavelet sharpening auto-enabled with per-level gains `[1.0, 1.8, 1.4, 1.0]`
+  (boost ring/band scales, skip noise scale).
 
-### Stage 5: RGB handling (`main.py`)
+### Stage 5: RGB handling (`rgb.py`)
 
 For colour FITS images (3, H, W):
 
@@ -245,20 +252,24 @@ Post-processing parameters are grouped in a `PostprocessConfig` dataclass:
 from postprocess import PostprocessConfig
 
 cfg = PostprocessConfig(
-    wv=25.0,       # wavelet threshold (0 = disabled)
-    nlm=0.008,     # NLM strength (0 = disabled)
-    sharpen=0.0,   # wavelet sharpening gain (0 = auto, 1.5 = moderate)
-    dp=0.5,        # disk preservation (0 = uniform, 1 = skip disk)
+    wv=25.0,             # wavelet threshold (0 = disabled)
+    nlm=0.008,           # NLM strength (0 = disabled)
+    sharpen=0.0,         # wavelet sharpening gain (0 = auto, 1.5 = moderate)
+    dp=0.5,              # disk preservation (0 = uniform, 1 = skip disk)
+    level_gains=None,    # per-level sharpening gains, finest first (None = bell curve)
 )
 ```
 
 ## Project structure
 
 ```
-main.py              CLI entry point, RGB pipeline, re-ranking
+main.py              CLI entry point + pipeline orchestration
 optimizer.py         Optuna TPE search, seed candidates, scoring
 deconvolve.py        RL+TV, Wiener, Tikhonov deconvolution
 postprocess.py       Wavelet + NLM post-processing, PostprocessConfig
+rerank.py            Post-processing re-ranking of top candidates
+rgb.py               RGB colour pipeline (white balance, contrast boost)
+fits_io.py           FITS loading/saving, luminance conversion
 metrics.py           Sharpness metrics, planet mask, weights
 psf.py               Gaussian, Moffat, Airy PSF models
 wavelet_utils.py     Shared SWT padding helpers
@@ -267,7 +278,7 @@ visualize.py         Result plots and metrics heatmaps
 tests/
   test_project.py          Unit tests (32)
   test_characterization.py Characterization tests (21) — refactoring safety net
-  test_refactored.py       Tests for extracted/refactored functions (62)
+  test_refactored.py       Tests for extracted/refactored functions (125)
   test_integration.py      Full pipeline vs reference images (4)
 
 test_images/               Real test images with input/ and reference/
@@ -293,7 +304,7 @@ python -m pytest tests/test_integration.py -v -n 4
 python -m pytest tests/ -v
 ```
 
-**115 fast tests** + **4 integration tests** = 119 total.
+**125 fast tests** + **4 integration tests** = 129 total.
 
 ## Results
 
@@ -304,9 +315,10 @@ Tested against PixInsight reference deconvolutions:
 | image1 | Jupiter | 110.7%            |
 | image2 | Jupiter | 100.3%            |
 | image3 | Jupiter | 111.7%            |
-| image4 | Saturn  | 135.9%            |
+| image4 | Saturn  | ~119–136%         |
 
-All 4 images pass (score >= 100% of reference).
+All 4 images pass (score >= 100% of reference). Saturn score varies between
+runs due to Optuna's stochastic nature; both ends of the range pass comfortably.
 
 ## Output
 
